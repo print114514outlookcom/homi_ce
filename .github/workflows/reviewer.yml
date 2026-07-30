@@ -13,12 +13,15 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Get PR diff (robust for forks)
+      # ------------------------------------------------------------
+      # Step 1: 获取 PR 的 diff（兼容 fork 场景）
+      # ------------------------------------------------------------
+      - name: Generate PR diff
         id: diff
         run: |
           set -e
@@ -26,26 +29,36 @@ jobs:
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
 
+          # 确保 base commit 存在
           git fetch --no-tags --prune origin "$BASE_SHA" || true
 
+          # 尝试通过 GitHub 的 refs/pull/N/head 获取 head
           if git fetch --no-tags --prune origin "pull/${PR_NUMBER}/head:pr_head"; then
             DIFF_RANGE="$BASE_SHA..pr_head"
           else
+            # 备选：直接拉取 head SHA（可能来自 fork）
             git fetch --no-tags --prune origin "$HEAD_SHA" || true
             if git rev-parse --verify --quiet "$HEAD_SHA" >/dev/null; then
               DIFF_RANGE="$BASE_SHA..$HEAD_SHA"
             else
-              echo "Error: Cannot fetch PR head" && exit 1
+              echo "Error: Cannot fetch PR head commit" >&2
+              exit 1
             fi
           fi
 
           git diff "$DIFF_RANGE" > pr.diff
+          # 限制 diff 行数，避免超出 API 限制
           head -n 5000 pr.diff > pr_trimmed.diff
+
+          # 输出 diff 内容供后续步骤使用
           echo "content<<EOF" >> $GITHUB_OUTPUT
           cat pr_trimmed.diff >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Ask DeepSeek v4-flash
+      # ------------------------------------------------------------
+      # Step 2: 调用 DeepSeek API 进行审查
+      # ------------------------------------------------------------
+      - name: Request DeepSeek v4-flash review
         id: ai
         env:
           API_KEY: ${{ secrets.llm_api_key }}
@@ -56,7 +69,7 @@ jobs:
           BODY="${{ github.event.pull_request.body }}"
           DIFF_FILE="pr_trimmed.diff"
 
-          # 使用 jq 构建请求体，避免 shell 转义问题
+          # 构建 JSON 请求体，避免 shell 转义问题
           jq -n \
             --arg model "deepseek-v4-flash" \
             --arg system "你是一个代码审查专家。根据 PR 的 diff 判断是否允许合并，重点检查：逻辑错误、安全漏洞、破坏性变更。只返回 JSON：{\"allowed\": true/false, \"reason\": \"原因\"}" \
@@ -75,6 +88,7 @@ jobs:
 
           echo "请求体大小: $(wc -c < request.json) 字节"
 
+          # 发送请求并记录 HTTP 状态码
           curl -s --max-time 60 -o response_body -w "%{http_code}" \
             https://api.deepseek.com/v1/chat/completions \
             -H "Content-Type: application/json" \
@@ -85,38 +99,44 @@ jobs:
           HTTP_CODE=$(cat http_code.txt)
           echo "HTTP状态码: $HTTP_CODE"
 
+          # 处理非 200 响应
           if [ "$HTTP_CODE" -ne 200 ]; then
-            echo "API调用失败，HTTP状态码: $HTTP_CODE"
-            cat response_body
+            echo "API 调用失败，状态码: $HTTP_CODE" >&2
+            cat response_body >&2
             echo "allowed=false" >> $GITHUB_OUTPUT
             echo "reason=DeepSeek API 调用失败 (HTTP $HTTP_CODE)" >> $GITHUB_OUTPUT
             exit 0
           fi
 
+          # 验证响应是否为有效 JSON
           if ! jq -e . response_body >/dev/null 2>&1; then
-            echo "响应不是有效的JSON，前200字符:"
-            head -c 200 response_body
-            echo ""
+            echo "响应不是有效的 JSON，前 200 字符:" >&2
+            head -c 200 response_body >&2
             echo "allowed=false" >> $GITHUB_OUTPUT
             echo "reason=DeepSeek 返回格式错误" >> $GITHUB_OUTPUT
             exit 0
           fi
 
+          # 提取 content 字段
           CONTENT=$(jq -r '.choices[0].message.content // ""' response_body)
           if [ -z "$CONTENT" ]; then
-            echo "内容为空"
+            echo "AI 返回内容为空" >&2
             echo "allowed=false" >> $GITHUB_OUTPUT
             echo "reason=DeepSeek 返回内容为空" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          ALLOWED=$(echo "$CONTENT" | jq -r '.allowed // false')
-          REASON=$(echo "$CONTENT" | jq -r '.reason // "未知原因"')
+          # 安全解析 AI 返回的 JSON（若解析失败则默认阻止）
+          ALLOWED=$(echo "$CONTENT" | jq -r '.allowed // false' 2>/dev/null || echo "false")
+          REASON=$(echo "$CONTENT" | jq -r '.reason // "未知原因"' 2>/dev/null || echo "AI 响应格式错误，拒绝合并")
 
           echo "allowed=$ALLOWED" >> $GITHUB_OUTPUT
           echo "reason=$REASON" >> $GITHUB_OUTPUT
           echo "AI 结论: allowed=$ALLOWED, reason=$REASON"
 
+      # ------------------------------------------------------------
+      # Step 3: 设置初始合并检查状态（Commit Status）
+      # ------------------------------------------------------------
       - name: Set initial merge check status
         id: set_status
         uses: actions/github-script@v7
@@ -138,12 +158,18 @@ jobs:
 
             core.setOutput('allowed', allowed);
 
+      # ------------------------------------------------------------
+      # Step 4: 若未通过审查，终止工作流
+      # ------------------------------------------------------------
       - name: Fail workflow if not allowed
         if: steps.set_status.outputs.allowed == 'false'
         run: |
           echo "❌ DeepSeek 审查未通过，合并被阻止。"
           exit 1
 
+      # ------------------------------------------------------------
+      # Step 5: 若通过审查，尝试自动合并
+      # ------------------------------------------------------------
       - name: Merge pull request if allowed
         if: steps.set_status.outputs.allowed == 'true'
         uses: actions/github-script@v7
@@ -153,7 +179,7 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
 
-            // 1. 检查是否可合并
+            // 1. 检查 PR 是否可合并（无冲突）
             const pr = await github.rest.pulls.get({
               owner,
               repo,
@@ -161,7 +187,7 @@ jobs:
             });
 
             if (pr.data.mergeable === false) {
-              // 有冲突 → 将状态改为 failure
+              // 有冲突 → 更新状态为 failure 并退出
               await github.rest.repos.createCommitStatus({
                 owner,
                 repo,
@@ -174,7 +200,7 @@ jobs:
               return;
             }
 
-            // 2. 尝试合并
+            // 2. 执行合并
             try {
               await github.rest.pulls.merge({
                 owner,
@@ -186,7 +212,7 @@ jobs:
               });
               console.log(`✅ PR #${prNumber} merged successfully.`);
             } catch (error) {
-              // 合并失败（例如意外冲突、权限等） → 状态改为 failure
+              // 合并失败（如权限、意外冲突等）→ 更新状态为 failure
               await github.rest.repos.createCommitStatus({
                 owner,
                 repo,
